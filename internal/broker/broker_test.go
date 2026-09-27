@@ -1,9 +1,14 @@
 package broker
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBroker_ConcurrentSubAndGetSubs(t *testing.T) {
@@ -96,5 +101,107 @@ func TestBroker_QueueLoadShedding(t *testing.T) {
 
 	if queued != 3 {
 		t.Fatalf("buffer cap is 3, so we expected 3 jobs to be queued (load shedding), got %d jobs queued", queued)
+	}
+}
+
+func TestBroker_HTTPDelivery(t *testing.T) {
+	var receivedEvents atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, received %s", r.Method)
+		}
+		if r.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("missing header Content-Type: application/json")
+		}
+		if r.Header.Get("X-Hook-Topic") != "order.paid" {
+			t.Errorf("wrong header X-Hook-Topic: %s", r.Header.Get("X-Hook-Topic"))
+		}
+
+		var evt Event
+		if err := json.NewDecoder(r.Body).Decode(&evt); err != nil {
+			t.Errorf("error while parsing JSON by receiving client: %v", err)
+		}
+		if evt.ID != "evt-123" {
+			t.Errorf("expected ID evt-123, got %s", evt.ID)
+		}
+
+		receivedEvents.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	b := NewBroker(10, 2)
+	b.Start()
+
+	b.Subscribe("order.paid", Subscriber{
+		ID:        "sub-test",
+		TargetURL: ts.URL,
+	})
+
+	b.Publish(Event{
+		ID:        "evt-123",
+		Topic:     "order.paid",
+		Payload:   json.RawMessage(`{"amount": 99.99}`),
+		Timestamp: time.Now(),
+	})
+
+	b.Stop()
+
+	if got := receivedEvents.Load(); got != 1 {
+		t.Fatalf("Target server should receive exactly 1 event, received: %d", got)
+	}
+}
+
+func TestBroker_HMACSignature(t *testing.T) {
+	const webhookSecret = "super-secret-key-123"
+	var signatureVerified atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sigHeader := r.Header.Get("X-Hook-Signature-256")
+		if sigHeader == "" {
+			t.Errorf("expected X-Hook-Signature-256, but it was empty")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		var rawBody json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&rawBody); err != nil {
+			t.Errorf("error parsing body: %v", err)
+			return
+		}
+
+		expectedSig := SignPayload(rawBody, webhookSecret)
+		if sigHeader != expectedSig {
+			t.Errorf("wrong HMAC signature!\nreceived:  %s\nexpected: %s", sigHeader, expectedSig)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		signatureVerified.Store(true)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	b := NewBroker(10, 2)
+	b.Start()
+
+	b.Subscribe("security.events", Subscriber{
+		ID:        "sub-secure",
+		TargetURL: ts.URL,
+		Secret:    webhookSecret,
+	})
+
+	b.Publish(Event{
+		ID:        "evt-sec-1",
+		Topic:     "security.events",
+		Payload:   json.RawMessage(`{"status":"compromised"}`),
+		Timestamp: time.Now().UTC(),
+	})
+
+	b.Stop()
+
+	if !signatureVerified.Load() {
+		t.Fatal("HMAC signature couldn'y be properly verified by the receiver")
 	}
 }
