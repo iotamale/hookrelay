@@ -1,0 +1,119 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"hookrelay/internal/broker"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+type subscribeRequest struct {
+	Topic string `json:"topic"`
+	TargetURL string `json:"target_url"`
+	Secret string `json:"secret"`
+}
+
+type publishRequest struct {
+	Topic string `json:"topic"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+func generateID(prefix string) string {
+	b := make([]byte, 6)
+	rand.Read(b)
+
+	return prefix + hex.EncodeToString(b)
+}
+
+func newRouter(b *broker.Broker) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /v1/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		var req subscribeRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+
+		if err != nil || req.TargetURL == "" || req.Topic == "" {
+			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+			return
+		}
+
+		sub := broker.Subscriber{
+			ID:        generateID("sub-"),
+			TargetURL: req.TargetURL,
+			Secret:    req.Secret,
+		}
+
+		b.Subscribe(req.Topic, sub)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(sub)
+	})
+
+	mux.HandleFunc("POST /v1/publish", func(w http.ResponseWriter, r *http.Request) {
+		var req publishRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+
+		if err != nil || req.Topic == "" {
+			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+			return
+		}
+
+		evt := broker.Event{
+			ID:        generateID("evt-"),
+			Topic:     req.Topic,
+			Payload:   req.Payload,
+			Timestamp: time.Now().UTC(),
+		}
+
+		queued := b.Publish(evt)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"event_id":          evt.ID,
+			"queued_deliveries": queued,
+		})
+	})
+
+	return mux
+}
+
+func main() {
+	b := broker.NewBroker(1024, 8)
+	b.Start()
+	
+	server := &http.Server{
+		Addr: ":8080",
+		Handler: newRouter(b),
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		slog.Info("HookRelay server listening", "addr", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("server error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	<- ctx.Done()
+	slog.Info("shutting down gracefully...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_ = server.Shutdown(shutdownCtx)
+	b.Stop()
+	slog.Info("server stopped")
+}
