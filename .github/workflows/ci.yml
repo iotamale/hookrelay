@@ -1,0 +1,42 @@
+name: CI
+
+on:
+    push:
+        branches: ['main', 'master']
+    pull_request:
+        branches: ['main', 'master']
+
+permissions:
+    contents: read
+
+jobs:
+    build-and-test:
+        name: Build, Race Test
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version-file: 'go.mod'
+                  cache: true
+
+            # - name: Check code formatting (gofmt)
+            #   run: |
+            #       if [ -n "$(gofmt -l .)" ]; then
+            #         echo "Go code is not formatted. Run 'gofmt -s -w .' locally:"
+            #         gofmt -d .
+            #         exit 1
+            #       fi
+
+            - name: Run static analysis (go vet)
+              run: go vet ./...
+
+            - name: Run tests with Race Detector
+              run: go test -v -race -coverprofile=coverage.out ./...
+
+            - name: Build HookRelay binary
+              run: go build -v -o bin/hookrelay ./cmd/hookrelay
