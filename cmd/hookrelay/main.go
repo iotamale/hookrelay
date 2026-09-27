@@ -16,13 +16,13 @@ import (
 )
 
 type subscribeRequest struct {
-	Topic string `json:"topic"`
+	Topic     string `json:"topic"`
 	TargetURL string `json:"target_url"`
-	Secret string `json:"secret"`
+	Secret    string `json:"secret"`
 }
 
 type publishRequest struct {
-	Topic string `json:"topic"`
+	Topic   string          `json:"topic"`
 	Payload json.RawMessage `json:"payload"`
 }
 
@@ -90,9 +90,9 @@ func newRouter(b *broker.Broker) http.Handler {
 func main() {
 	b := broker.NewBroker(1024, 8)
 	b.Start()
-	
+
 	server := &http.Server{
-		Addr: ":8080",
+		Addr:    ":8080",
 		Handler: newRouter(b),
 	}
 
@@ -107,7 +107,7 @@ func main() {
 		}
 	}()
 
-	<- ctx.Done()
+	<-ctx.Done()
 	slog.Info("shutting down gracefully...")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

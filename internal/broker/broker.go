@@ -13,37 +13,37 @@ import (
 )
 
 type Subscriber struct {
-	ID string
-	TargetURL string
-	Secret string
+	ID        string `json:"id"`
+	TargetURL string `json:"target_url"`
+	Secret    string `json:"secret,omitempty"`
 }
 
 type Event struct {
-	ID string
-	Topic string
-	Payload json.RawMessage
-	Timestamp time.Time
+	ID        string          `json:"id"`
+	Topic     string          `json:"topic"`
+	Payload   json.RawMessage `json:"payload"`
+	Timestamp time.Time       `json:"timestamp"`
 }
 
 type Broker struct {
-	mu sync.RWMutex
-	subscribers map[string][]Subscriber		// topic -> []Subscribers
-	jobs chan DeliveryJob
-	wg sync.WaitGroup
+	mu          sync.RWMutex
+	subscribers map[string][]Subscriber // topic -> []Subscribers
+	jobs        chan DeliveryJob
+	wg          sync.WaitGroup
 	workerCount int
-	processed atomic.Int64
-	client *http.Client
+	processed   atomic.Int64
+	client      *http.Client
 }
 
 type DeliveryJob struct {
 	Subscriber Subscriber
-	Event Event
+	Event      Event
 }
 
 func NewBroker(queueSize int, workerCount int) *Broker {
 	return &Broker{
 		subscribers: make(map[string][]Subscriber),
-		jobs: make(chan DeliveryJob, queueSize),
+		jobs:        make(chan DeliveryJob, queueSize),
 		workerCount: workerCount,
 		client: &http.Client{
 			Timeout: 5 * time.Second,
@@ -93,7 +93,7 @@ func (b *Broker) Publish(evt Event) int {
 	for _, sub := range subs {
 		deliveryJob := DeliveryJob{
 			Subscriber: sub,
-			Event: evt,
+			Event:      evt,
 		}
 
 		select {

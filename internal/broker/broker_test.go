@@ -24,7 +24,7 @@ func TestBroker_ConcurrentSubAndGetSubs(t *testing.T) {
 			defer wg.Done()
 
 			sub := Subscriber{
-				ID: fmt.Sprintf("sub-%d", id),
+				ID:        fmt.Sprintf("sub-%d", id),
 				TargetURL: fmt.Sprintf("http://localhost:9000/webhook/%d", id),
 			}
 			b.Subscribe(topic, sub)
