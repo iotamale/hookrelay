@@ -2,14 +2,23 @@ package broker
 
 import (
 	"bytes"
+	"container/heap"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+var (
+	MaxRetries  = 5
+	BaseBackoff = 1 * time.Second
+	MaxBackoff  = 1 * time.Hour
 )
 
 type Subscriber struct {
@@ -29,18 +38,28 @@ type Broker struct {
 	mu          sync.RWMutex
 	subscribers map[string][]Subscriber // topic -> []Subscribers
 	jobs        chan DeliveryJob
-	wg          sync.WaitGroup
+	wg          sync.WaitGroup // tracks active worker goroutines
+	schedulerWg sync.WaitGroup // tracks retry scheduler goroutine
 	workerCount int
 	processed   atomic.Int64
 	client      *http.Client
+	retryMu     sync.Mutex    // protects retires min heap
+	retries     *retryHeap    // Min-Heap ordering failed jobs by Broker.NextAttemptAt
+	newRetry    chan struct{} // wakes up retry scheduler when new job is pushed to the heap
+	done        chan struct{}
 }
 
 type DeliveryJob struct {
-	Subscriber Subscriber
-	Event      Event
+	Subscriber    Subscriber
+	Event         Event
+	Attempt       int
+	NextAttemptAt time.Time
 }
 
 func NewBroker(queueSize int, workerCount int) *Broker {
+	h := &retryHeap{}
+	heap.Init(h)
+
 	return &Broker{
 		subscribers: make(map[string][]Subscriber),
 		jobs:        make(chan DeliveryJob, queueSize),
@@ -48,6 +67,9 @@ func NewBroker(queueSize int, workerCount int) *Broker {
 		client: &http.Client{
 			Timeout: 5 * time.Second,
 		},
+		retries:  h,
+		newRetry: make(chan struct{}, 1),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -70,10 +92,23 @@ func (b *Broker) GetSubscribers(topic string) []Subscriber {
 }
 
 func (b *Broker) Start() {
+	b.schedulerWg.Add(1)
+	go b.retryScheduler()
+
 	for i := 0; i < b.workerCount; i++ {
 		b.wg.Add(1)
 		go b.worker(i)
 	}
+}
+
+func (b *Broker) Stop() {
+	// Signal retry scheduler to stop accepting new jobs
+	close(b.done)
+	b.schedulerWg.Wait()
+
+	// Close the main job queue
+	close(b.jobs)
+	b.wg.Wait()
 }
 
 func (b *Broker) worker(id int) {
@@ -107,13 +142,6 @@ func (b *Broker) Publish(evt Event) int {
 	return queued
 }
 
-func (b *Broker) Stop() {
-	close(b.jobs)
-
-	b.wg.Wait()
-
-}
-
 func (b *Broker) ProcessedCount() int64 {
 	return b.processed.Load()
 }
@@ -142,11 +170,105 @@ func (b *Broker) deliver(job DeliveryJob) {
 
 	resp, err := b.client.Do(req)
 
+	isTransient := false
+
 	if err != nil {
-		return
+		// network errors
+		isTransient = true
+	} else {
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return
+		}
+
+		if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			isTransient = true
+		} else {
+			slog.Warn("permanent client error, dropping webhook", "url", job.Subscriber.TargetURL, "status", resp.StatusCode)
+			return
+		}
 	}
 
-	defer resp.Body.Close()
+	if isTransient {
+		if job.Attempt < MaxRetries {
+			job.Attempt++
+			delay := nextBackoff(job.Attempt, BaseBackoff, MaxBackoff)
+			job.NextAttemptAt = time.Now().Add(delay)
+
+			slog.Info("transient error, scheduling retry", "url", job.Subscriber.TargetURL, "attempt", job.Attempt, "delay", delay)
+			b.scheduleRetry(job)
+		} else {
+			slog.Warn("exhausted retries, dropping webhook", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL)
+		}
+	}
+}
+
+func (b *Broker) scheduleRetry(job DeliveryJob) {
+	b.retryMu.Lock()
+	heap.Push(b.retries, job)
+	b.retryMu.Unlock()
+
+	// Wake up the scheduler
+	select {
+	case b.newRetry <- struct{}{}:
+	default:
+	}
+}
+
+func (b *Broker) retryScheduler() {
+	defer b.schedulerWg.Done()
+
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+
+	for {
+		b.retryMu.Lock()
+		if b.retries.Len() == 0 {
+			b.retryMu.Unlock()
+			// The heap is empty, sleep until a new retry is scheduled.
+			select {
+			case <-b.newRetry:
+				continue
+			case <-b.done:
+				return
+			}
+		}
+
+		nextJob := (*b.retries)[0]
+		now := time.Now()
+
+		if now.After(nextJob.NextAttemptAt) || now.Equal(nextJob.NextAttemptAt) {
+			job := heap.Pop(b.retries).(DeliveryJob)
+			b.retryMu.Unlock()
+
+			select {
+			case b.jobs <- job:
+			default:
+				// buffer is full
+			}
+			continue
+		}
+
+		delay := nextJob.NextAttemptAt.Sub(now)
+		b.retryMu.Unlock()
+
+		timer.Reset(delay)
+
+		select {
+		case <-timer.C:
+		case <-b.newRetry:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-b.done:
+			timer.Stop()
+			return
+		}
+	}
 }
 
 func SignPayload(payload []byte, secret string) string {
