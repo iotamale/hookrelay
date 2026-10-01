@@ -205,3 +205,51 @@ func TestBroker_HMACSignature(t *testing.T) {
 		t.Fatal("HMAC signature couldn'y be properly verified by the receiver")
 	}
 }
+
+func TestBroker_RetryLogic(t *testing.T) {
+	originalBase := BaseBackoff
+	originalMax := MaxBackoff
+	BaseBackoff = 10 * time.Millisecond
+	MaxBackoff = 50 * time.Millisecond
+	defer func() {
+		BaseBackoff = originalBase
+		MaxBackoff = originalMax
+	}()
+
+	var attempts atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := attempts.Add(1)
+
+		if current <= 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	b := NewBroker(10, 2)
+	b.Start()
+
+	b.Subscribe("orders", Subscriber{
+		ID:        "sub",
+		TargetURL: ts.URL,
+	})
+
+	b.Publish(Event{
+		ID:        "evt-retry",
+		Topic:     "orders",
+		Payload:   json.RawMessage(`{}`),
+		Timestamp: time.Now(),
+	})
+
+	time.Sleep(150 * time.Millisecond)
+
+	b.Stop()
+
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("expected 3 attemps (2 failed + 1 succesful), got: %d", got)
+	}
+}
