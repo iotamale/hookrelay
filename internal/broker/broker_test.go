@@ -253,3 +253,64 @@ func TestBroker_RetryLogic(t *testing.T) {
 		t.Fatalf("expected 3 attemps (2 failed + 1 succesful), got: %d", got)
 	}
 }
+
+func TestBroker_CircuitBreaker_FastFailure(t *testing.T) {
+	origThreshold := FailuresThreshold
+	origTimeout := OpenStateTimeoutDuration
+	origBase := BaseBackoff
+	origMax := MaxBackoff
+	FailuresThreshold = 2
+	OpenStateTimeoutDuration = 200 * time.Millisecond
+	BaseBackoff = 5 * time.Millisecond
+	MaxBackoff = 20 * time.Millisecond
+	defer func() {
+		FailuresThreshold = origThreshold
+		OpenStateTimeoutDuration = origTimeout
+		BaseBackoff = origBase
+		MaxBackoff = origMax
+	}()
+
+	var downstreamHits atomic.Int32
+
+	// Server simulation HTTP 500
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downstreamHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	b := NewBroker(50, 4)
+	b.Start()
+
+	b.Subscribe("incident", Subscriber{
+		ID:        "sub-dead",
+		TargetURL: ts.URL,
+	})
+
+	for i := 0; i < 10; i++ {
+		b.Publish(Event{
+			ID:        fmt.Sprintf("evt-cb-%d", i),
+			Topic:     "incident",
+			Payload:   json.RawMessage(`{}`),
+			Timestamp: time.Now(),
+		})
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	cb := b.getBreaker(ts.URL)
+	cb.mu.Lock()
+	state := cb.state
+	cb.mu.Unlock()
+
+	if state != StateOpen {
+		t.Fatalf("expected Circuit Breaker to be OPEN, got state %v", state)
+	}
+
+	hits := downstreamHits.Load()
+	if hits >= 10 {
+		t.Fatalf("Circuit Breaker failed to prevent network calls: received %d downstream hits", hits)
+	}
+
+	b.Stop()
+}
