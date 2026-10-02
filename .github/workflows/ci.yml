@@ -2,7 +2,7 @@ name: CI
 
 on:
     push:
-        branches: ['main', 'master']
+        branches: ['**']
     pull_request:
         branches: ['main', 'master']
 
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
     build-and-test:
-        name: Build, Race Test
+        name: Build and run tests
         runs-on: ubuntu-latest
 
         steps:
