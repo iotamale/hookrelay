@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	MaxRetries  = 5
+	MaxRetries  = 13
 	BaseBackoff = 1 * time.Second
 	MaxBackoff  = 1 * time.Hour
 )
@@ -47,6 +47,8 @@ type Broker struct {
 	retries     *retryHeap    // Min-Heap ordering failed jobs by Broker.NextAttemptAt
 	newRetry    chan struct{} // wakes up retry scheduler when new job is pushed to the heap
 	done        chan struct{}
+	breakers    map[string]*CircuitBreaker // TargetURL -> *CircuitBreaker
+	breakersMu  sync.RWMutex
 }
 
 type DeliveryJob struct {
@@ -67,6 +69,7 @@ func NewBroker(queueSize int, workerCount int) *Broker {
 		client: &http.Client{
 			Timeout: 5 * time.Second,
 		},
+		breakers: make(map[string]*CircuitBreaker),
 		retries:  h,
 		newRetry: make(chan struct{}, 1),
 		done:     make(chan struct{}),
@@ -147,6 +150,13 @@ func (b *Broker) ProcessedCount() int64 {
 }
 
 func (b *Broker) deliver(job DeliveryJob) {
+	cb := b.getBreaker(job.Subscriber.TargetURL)
+
+	if !cb.Allow() {
+		b.handleRetryScheduling(job)
+		return
+	}
+
 	body, err := json.Marshal(job.Event)
 
 	if err != nil {
@@ -174,16 +184,21 @@ func (b *Broker) deliver(job DeliveryJob) {
 
 	if err != nil {
 		// network errors
+		cb.RecordFailure()
 		isTransient = true
 	} else {
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, resp.Body)
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			cb.RecordSuccess()
 			return
 		}
 
-		if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= 500 {
+			cb.RecordFailure()
+			isTransient = true
+		} else if resp.StatusCode == http.StatusTooManyRequests {
 			isTransient = true
 		} else {
 			slog.Warn("permanent client error, dropping webhook", "url", job.Subscriber.TargetURL, "status", resp.StatusCode)
@@ -192,16 +207,20 @@ func (b *Broker) deliver(job DeliveryJob) {
 	}
 
 	if isTransient {
-		if job.Attempt < MaxRetries {
-			job.Attempt++
-			delay := nextBackoff(job.Attempt, BaseBackoff, MaxBackoff)
-			job.NextAttemptAt = time.Now().Add(delay)
+		b.handleRetryScheduling(job)
+	}
+}
 
-			slog.Info("transient error, scheduling retry", "url", job.Subscriber.TargetURL, "attempt", job.Attempt, "delay", delay)
-			b.scheduleRetry(job)
-		} else {
-			slog.Warn("exhausted retries, dropping webhook", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL)
-		}
+func (b *Broker) handleRetryScheduling(job DeliveryJob) {
+	if job.Attempt < MaxRetries {
+		job.Attempt++
+		delay := nextBackoff(job.Attempt, BaseBackoff, MaxBackoff)
+		job.NextAttemptAt = time.Now().Add(delay)
+
+		slog.Info("transient error, scheduling retry", "url", job.Subscriber.TargetURL, "attempt", job.Attempt, "delay", delay)
+		b.scheduleRetry(job)
+	} else {
+		slog.Warn("exhausted retries, dropping webhook", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL)
 	}
 }
 
@@ -269,6 +288,33 @@ func (b *Broker) retryScheduler() {
 			return
 		}
 	}
+}
+
+// getBreaker returns *CircuitBreaker for specified TargetURL.
+// If one doesn't exist, it creates a new one.
+func (b *Broker) getBreaker(url string) *CircuitBreaker {
+	b.breakersMu.RLock()
+	val, exists := b.breakers[url]
+	b.breakersMu.RUnlock()
+
+	if exists {
+		return val
+	}
+
+	b.breakersMu.Lock()
+	defer b.breakersMu.Unlock()
+
+	// Doublecheck
+	val, exists = b.breakers[url]
+
+	if !exists {
+		val = &CircuitBreaker{
+			state: StateClosed,
+		}
+		b.breakers[url] = val
+	}
+
+	return val
 }
 
 func SignPayload(payload []byte, secret string) string {
