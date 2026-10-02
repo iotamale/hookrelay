@@ -100,7 +100,7 @@ func (b *Broker) Start() {
 
 	for i := 0; i < b.workerCount; i++ {
 		b.wg.Add(1)
-		go b.worker(i)
+		go b.worker()
 	}
 }
 
@@ -114,7 +114,7 @@ func (b *Broker) Stop() {
 	b.wg.Wait()
 }
 
-func (b *Broker) worker(id int) {
+func (b *Broker) worker() {
 	defer b.wg.Done()
 
 	for job := range b.jobs {
