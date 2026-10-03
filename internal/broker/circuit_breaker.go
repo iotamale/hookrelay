@@ -33,6 +33,7 @@ type CircuitBreaker struct {
 	mu            sync.Mutex
 	failuresCount uint16
 	expiresAt     time.Time
+	lastAccessed  time.Time
 }
 
 // RecordFailure increments the failure counter.
@@ -62,6 +63,8 @@ func (cb *CircuitBreaker) RecordSuccess() {
 func (cb *CircuitBreaker) Allow() bool {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+
+	cb.lastAccessed = time.Now()
 
 	switch cb.state {
 	case StateOpen:

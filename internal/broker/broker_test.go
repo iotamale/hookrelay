@@ -314,3 +314,52 @@ func TestBroker_CircuitBreaker_FastFailure(t *testing.T) {
 
 	b.Stop()
 }
+
+// Test GC logic
+func TestBroker_CircuitBreakerGC(t *testing.T) {
+	// We overwrite TTL for testing reasons
+	origTTL := BreakerGCTTL
+	BreakerGCTTL = 100 * time.Millisecond
+	defer func() { BreakerGCTTL = origTTL }()
+
+	b := NewBroker(10, 2)
+	now := time.Now()
+
+	b.breakers["url-stale-closed"] = &CircuitBreaker{
+		state:        StateClosed,
+		lastAccessed: now.Add(-200 * time.Millisecond), // Older than TTL -> to be deleted
+	}
+
+	b.breakers["url-fresh-closed"] = &CircuitBreaker{
+		state:        StateClosed,
+		lastAccessed: now, // Fresh -> stays
+	}
+
+	b.breakers["url-stale-open"] = &CircuitBreaker{
+		state:        StateOpen,
+		lastAccessed: now.Add(-200 * time.Millisecond), // Older, but OPEN -> stays
+	}
+
+	b.breakers["url-stale-halfopen"] = &CircuitBreaker{
+		state:        StateHalfOpen,
+		lastAccessed: now.Add(-200 * time.Millisecond), // Older, but HALOFEN -> stays
+	}
+
+	b.cleanUpBreakers()
+
+	if _, exists := b.breakers["url-stale-closed"]; exists {
+		t.Errorf("expected url-stale-closed to be deleted")
+	}
+
+	if _, exists := b.breakers["url-fresh-closed"]; !exists {
+		t.Errorf("expected url-fresh-closed to be kept (was fresh)")
+	}
+
+	if _, exists := b.breakers["url-stale-open"]; !exists {
+		t.Errorf("expected url-stale-open to be kept (was not closed)")
+	}
+
+	if _, exists := b.breakers["url-stale-halfopen"]; !exists {
+		t.Errorf("expected url-stale-halfopen to be kept (was not closed)")
+	}
+}
