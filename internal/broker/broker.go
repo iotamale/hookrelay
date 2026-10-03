@@ -30,7 +30,7 @@ type Config struct {
 type Subscriber struct {
 	ID        string `json:"id"`
 	TargetURL string `json:"target_url"`
-	Secret    string `json:"secret,omitempty"`
+	Secret    string `json:"-"`
 }
 
 type Event struct {
