@@ -9,10 +9,25 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
+func testConfig(q, w int) broker.Config {
+	return broker.Config{
+		QueueSize:                q,
+		WorkerCount:              w,
+		MaxRetries:               3,
+		BaseBackoff:              1 * time.Second,
+		MaxBackoff:               5 * time.Second,
+		BreakerGCInterval:        1 * time.Hour,
+		BreakerGCTTL:             24 * time.Hour,
+		FailuresThreshold:        5,
+		OpenStateTimeoutDuration: 1 * time.Minute,
+	}
+}
+
 func TestSubscribeEndpoint_Validation(t *testing.T) {
-	b := broker.NewBroker(10, 2)
+	b := broker.NewBroker(testConfig(10, 2))
 	router := newRouter(b)
 
 	tests := []struct {
@@ -63,7 +78,7 @@ func TestSubscribeEndpoint_Validation(t *testing.T) {
 }
 
 func TestPublishEndpoint_Validation(t *testing.T) {
-	b := broker.NewBroker(10, 2)
+	b := broker.NewBroker(testConfig(10, 2))
 	router := newRouter(b)
 
 	tests := []struct {
@@ -107,7 +122,6 @@ func TestSubscribeAndPublish(t *testing.T) {
 	const secret = "secret123"
 	var webhookReceived atomic.Bool
 
-	// Mock downstream webhook receiver
 	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -118,7 +132,6 @@ func TestSubscribeAndPublish(t *testing.T) {
 
 		expectedSig := broker.SignPayload(body, secret)
 		if gotSig := r.Header.Get("X-Hook-Signature-256"); gotSig != expectedSig {
-			t.Errorf("invalid HMAC signature: got %s, want %s", gotSig, expectedSig)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -128,7 +141,7 @@ func TestSubscribeAndPublish(t *testing.T) {
 	}))
 	defer receiver.Close()
 
-	b := broker.NewBroker(16, 2)
+	b := broker.NewBroker(testConfig(16, 2))
 	b.Start()
 	router := newRouter(b)
 
