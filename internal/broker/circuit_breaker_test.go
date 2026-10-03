@@ -6,34 +6,26 @@ import (
 )
 
 func TestCircuitBreaker_StateTransitions(t *testing.T) {
-	// Temporarily override variables to speed up the test execution
-	originalThreshold := FailuresThreshold
-	originalTimeout := OpenStateTimeoutDuration
-	FailuresThreshold = 3
-	OpenStateTimeoutDuration = 50 * time.Millisecond
-	defer func() {
-		FailuresThreshold = originalThreshold
-		OpenStateTimeoutDuration = originalTimeout
-	}()
+	cb := &CircuitBreaker{
+		state:                    StateClosed,
+		failuresThreshold:        3,
+		openStateTimeoutDuration: 50 * time.Millisecond,
+	}
 
-	cb := &CircuitBreaker{}
-
-	// Initial State (CLOSED)
 	if !cb.Allow() {
 		t.Fatalf("expected circuit breaker to allow requests initially")
 	}
 
 	// Record failures up to the threshold
-	for i := uint16(0); i < FailuresThreshold-1; i++ {
+	for i := uint16(0); i < 2; i++ {
 		cb.RecordFailure()
 	}
 	if !cb.Allow() {
 		t.Fatalf("expected circuit breaker to remain CLOSED at 1 below the threshold")
 	}
 
-	// One more failure trips the breaker
+	// 3rd failure trips the breaker
 	cb.RecordFailure()
-
 	if cb.Allow() {
 		t.Fatalf("expected circuit breaker to deny requests when OPEN")
 	}

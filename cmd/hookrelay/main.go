@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"hookrelay/internal/broker"
+	"hookrelay/internal/config"
 	"log/slog"
 	"net/http"
 	"os"
@@ -88,11 +89,29 @@ func newRouter(b *broker.Broker) http.Handler {
 }
 
 func main() {
-	b := broker.NewBroker(1024, 8)
+	appCfg := config.Load()
+	brokerCfg := broker.Config{
+		QueueSize:                appCfg.QueueSize,
+		WorkerCount:              appCfg.WorkerCount,
+		MaxRetries:               appCfg.MaxRetries,
+		BaseBackoff:              appCfg.BaseBackoff,
+		MaxBackoff:               appCfg.MaxBackoff,
+		BreakerGCInterval:        appCfg.BreakerGCInterval,
+		BreakerGCTTL:             appCfg.BreakerGCTTL,
+		FailuresThreshold:        appCfg.FailuresThreshold,
+		OpenStateTimeoutDuration: appCfg.OpenStateTimeoutDuration,
+	}
+
+	b := broker.NewBroker(brokerCfg)
 	b.Start()
 
+	addr := ":" + appCfg.Port
+	if appCfg.Port[0] == ':' {
+		addr = appCfg.Port
+	}
+
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    addr,
 		Handler: newRouter(b),
 	}
 
@@ -100,7 +119,7 @@ func main() {
 	defer stop()
 
 	go func() {
-		slog.Info("HookRelay server listening", "addr", server.Addr)
+		slog.Info("HookRelay server listening", "addr", server.Addr, "workers", appCfg.WorkerCount, "queue_size", appCfg.QueueSize)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "err", err)
 			os.Exit(1)

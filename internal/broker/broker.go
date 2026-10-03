@@ -15,13 +15,17 @@ import (
 	"time"
 )
 
-var (
-	MaxRetries        = 13
-	BaseBackoff       = 1 * time.Second
-	MaxBackoff        = 1 * time.Hour
-	BreakerGCInterval = 1 * time.Hour
-	BreakerGCTTL      = 24 * time.Hour
-)
+type Config struct {
+	QueueSize                int
+	WorkerCount              int
+	MaxRetries               int
+	BaseBackoff              time.Duration
+	MaxBackoff               time.Duration
+	BreakerGCInterval        time.Duration
+	BreakerGCTTL             time.Duration
+	FailuresThreshold        uint16
+	OpenStateTimeoutDuration time.Duration
+}
 
 type Subscriber struct {
 	ID        string `json:"id"`
@@ -37,6 +41,7 @@ type Event struct {
 }
 
 type Broker struct {
+	cfg         Config
 	mu          sync.RWMutex
 	subscribers map[string][]Subscriber // topic -> []Subscribers
 	jobs        chan DeliveryJob
@@ -60,14 +65,15 @@ type DeliveryJob struct {
 	NextAttemptAt time.Time
 }
 
-func NewBroker(queueSize int, workerCount int) *Broker {
+func NewBroker(cfg Config) *Broker {
 	h := &retryHeap{}
 	heap.Init(h)
 
 	return &Broker{
+		cfg:         cfg,
 		subscribers: make(map[string][]Subscriber),
-		jobs:        make(chan DeliveryJob, queueSize),
-		workerCount: workerCount,
+		jobs:        make(chan DeliveryJob, cfg.QueueSize),
+		workerCount: cfg.WorkerCount,
 		client: &http.Client{
 			Timeout: 5 * time.Second,
 		},
@@ -217,9 +223,9 @@ func (b *Broker) deliver(job DeliveryJob) {
 }
 
 func (b *Broker) handleRetryScheduling(job DeliveryJob) {
-	if job.Attempt < MaxRetries {
+	if job.Attempt < b.cfg.MaxRetries {
 		job.Attempt++
-		delay := nextBackoff(job.Attempt, BaseBackoff, MaxBackoff)
+		delay := nextBackoff(job.Attempt, b.cfg.BaseBackoff, b.cfg.MaxBackoff)
 		job.NextAttemptAt = time.Now().Add(delay)
 
 		slog.Info("transient error, scheduling retry", "url", job.Subscriber.TargetURL, "attempt", job.Attempt, "delay", delay)
@@ -314,8 +320,10 @@ func (b *Broker) getBreaker(url string) *CircuitBreaker {
 
 	if !exists {
 		val = &CircuitBreaker{
-			state:        StateClosed,
-			lastAccessed: time.Now(),
+			state:                    StateClosed,
+			lastAccessed:             time.Now(),
+			failuresThreshold:        b.cfg.FailuresThreshold,
+			openStateTimeoutDuration: b.cfg.OpenStateTimeoutDuration,
 		}
 		b.breakers[url] = val
 	}
@@ -334,7 +342,7 @@ func SignPayload(payload []byte, secret string) string {
 func (b *Broker) breakerGarbageCollector() {
 	defer b.schedulerWg.Done()
 
-	ticker := time.NewTicker(BreakerGCInterval)
+	ticker := time.NewTicker(b.cfg.BreakerGCInterval)
 	defer ticker.Stop()
 
 	for {
@@ -356,7 +364,7 @@ func (b *Broker) cleanUpBreakers() {
 	for url, cb := range b.breakers {
 		cb.mu.Lock()
 		isClosed := cb.state == StateClosed
-		isStale := now.Sub(cb.lastAccessed) > BreakerGCTTL
+		isStale := now.Sub(cb.lastAccessed) > b.cfg.BreakerGCTTL
 		cb.mu.Unlock()
 
 		if isClosed && isStale {
