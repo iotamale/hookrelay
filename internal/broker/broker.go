@@ -16,9 +16,11 @@ import (
 )
 
 var (
-	MaxRetries  = 13
-	BaseBackoff = 1 * time.Second
-	MaxBackoff  = 1 * time.Hour
+	MaxRetries        = 13
+	BaseBackoff       = 1 * time.Second
+	MaxBackoff        = 1 * time.Hour
+	BreakerGCInterval = 1 * time.Hour
+	BreakerGCTTL      = 24 * time.Hour
 )
 
 type Subscriber struct {
@@ -97,6 +99,9 @@ func (b *Broker) GetSubscribers(topic string) []Subscriber {
 func (b *Broker) Start() {
 	b.schedulerWg.Add(1)
 	go b.retryScheduler()
+
+	b.schedulerWg.Add(1)
+	go b.breakerGarbageCollector()
 
 	for i := 0; i < b.workerCount; i++ {
 		b.wg.Add(1)
@@ -309,7 +314,8 @@ func (b *Broker) getBreaker(url string) *CircuitBreaker {
 
 	if !exists {
 		val = &CircuitBreaker{
-			state: StateClosed,
+			state:        StateClosed,
+			lastAccessed: time.Now(),
 		}
 		b.breakers[url] = val
 	}
@@ -323,4 +329,39 @@ func SignPayload(payload []byte, secret string) string {
 
 	hashString := hex.EncodeToString(mac.Sum(nil))
 	return "sha256=" + hashString
+}
+
+func (b *Broker) breakerGarbageCollector() {
+	defer b.schedulerWg.Done()
+
+	ticker := time.NewTicker(BreakerGCInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			b.cleanUpBreakers()
+		case <-b.done:
+			return // graceful shutdown
+		}
+	}
+}
+
+func (b *Broker) cleanUpBreakers() {
+	b.breakersMu.Lock()
+	defer b.breakersMu.Unlock()
+
+	now := time.Now()
+
+	for url, cb := range b.breakers {
+		cb.mu.Lock()
+		isClosed := cb.state == StateClosed
+		isStale := now.Sub(cb.lastAccessed) > BreakerGCTTL
+		cb.mu.Unlock()
+
+		if isClosed && isStale {
+			delete(b.breakers, url)
+		}
+	}
+
 }
