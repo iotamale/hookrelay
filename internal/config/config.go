@@ -1,9 +1,12 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -20,6 +23,10 @@ type Config struct {
 }
 
 func Load() Config {
+	if err := godotenv.Load(); err != nil {
+		slog.Info("no .env file found, relying on system environment variables")
+	}
+
 	return Config{
 		Port:                     getEnv("PORT", "8080"),
 		WorkerCount:              getEnvAsInt("WORKER_COUNT", 8),
