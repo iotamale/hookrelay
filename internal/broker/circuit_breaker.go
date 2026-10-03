@@ -7,15 +7,6 @@ import (
 
 type CircuitBreakerState int
 
-var (
-	// FailuresThreshold defines how many consecutive failures are allowed
-	// before transitions to the OPEN state.
-	FailuresThreshold uint16 = 5
-	// OpenStateTimeoutDuration defines how long the circuit remains OPEN
-	// before allowing a probe request (transitioning to HALF-OPEN).
-	OpenStateTimeoutDuration = 60 * time.Second
-)
-
 const (
 	// StateClosed indicates normal operation. All requests are allowed to pass through.
 	StateClosed = iota
@@ -34,6 +25,13 @@ type CircuitBreaker struct {
 	failuresCount uint16
 	expiresAt     time.Time
 	lastAccessed  time.Time
+
+	// FailuresThreshold defines how many consecutive failures are allowed
+	// before transitions to the OPEN state.
+	failuresThreshold uint16
+	// OpenStateTimeoutDuration defines how long the circuit remains OPEN
+	// before allowing a probe request (transitioning to HALF-OPEN).
+	openStateTimeoutDuration time.Duration
 }
 
 // RecordFailure increments the failure counter.
@@ -44,9 +42,9 @@ func (cb *CircuitBreaker) RecordFailure() {
 
 	cb.failuresCount++
 
-	if cb.failuresCount >= FailuresThreshold {
+	if cb.failuresCount >= cb.failuresThreshold {
 		cb.state = StateOpen
-		cb.expiresAt = time.Now().Add(OpenStateTimeoutDuration)
+		cb.expiresAt = time.Now().Add(cb.openStateTimeoutDuration)
 	}
 }
 
