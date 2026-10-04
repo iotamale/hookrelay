@@ -141,6 +141,13 @@ func (b *Broker) worker() {
 }
 
 func (b *Broker) Publish(evt Event) int {
+	select {
+	case <-b.done:
+		// Broker is being shutdown, prevent writing to closed b.jobs channel
+		return 0
+	default:
+	}
+
 	subs := b.GetSubscribers(evt.Topic)
 	queued := 0
 
