@@ -14,6 +14,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/lmittmann/tint"
 )
 
 type subscribeRequest struct {
@@ -90,6 +92,27 @@ func newRouter(b *broker.Broker) http.Handler {
 
 func main() {
 	appCfg := config.Load()
+	var handler slog.Handler
+
+	switch appCfg.SlogOutputFormat {
+	case "json":
+		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		})
+	case "text":
+		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		})
+	default: // "tint"
+		handler = tint.NewTextHandler(os.Stdout, &tint.Options{
+			Level:      slog.LevelInfo,
+			TimeFormat: time.TimeOnly,
+		})
+	}
+
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+
 	brokerCfg := broker.Config{
 		QueueSize:                appCfg.QueueSize,
 		WorkerCount:              appCfg.WorkerCount,

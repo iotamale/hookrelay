@@ -103,12 +103,14 @@ func (b *Broker) GetSubscribers(topic string) []Subscriber {
 }
 
 func (b *Broker) Start() {
+	slog.Info("starting broker")
 	b.schedulerWg.Add(1)
 	go b.retryScheduler()
 
 	b.schedulerWg.Add(1)
 	go b.breakerGarbageCollector()
 
+	slog.Info("initializing worker pool", "worker_count", b.workerCount)
 	for i := 0; i < b.workerCount; i++ {
 		b.wg.Add(1)
 		go b.worker()
@@ -116,6 +118,7 @@ func (b *Broker) Start() {
 }
 
 func (b *Broker) Stop() {
+	slog.Info("shutting down broker")
 	// Signal retry scheduler to stop accepting new jobs
 	close(b.done)
 	b.schedulerWg.Wait()
@@ -123,6 +126,8 @@ func (b *Broker) Stop() {
 	// Close the main job queue
 	close(b.jobs)
 	b.wg.Wait()
+
+	slog.Info("broker shutdown complete", "processed_events", b.ProcessedCount())
 }
 
 func (b *Broker) worker() {
@@ -149,7 +154,7 @@ func (b *Broker) Publish(evt Event) int {
 		case b.jobs <- deliveryJob:
 			queued++
 		default:
-			// buffer is full
+			slog.Warn("buffer is full, job skipped", "event_id", evt.ID, "topic", evt.Topic, "target_url", deliveryJob.Subscriber.TargetURL)
 		}
 	}
 
@@ -194,7 +199,7 @@ func (b *Broker) deliver(job DeliveryJob) {
 	isTransient := false
 
 	if err != nil {
-		// network errors
+		slog.Warn("network error during delivery", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL, "error", err.Error())
 		cb.RecordFailure()
 		isTransient = true
 	} else {
@@ -203,16 +208,19 @@ func (b *Broker) deliver(job DeliveryJob) {
 
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			cb.RecordSuccess()
+			slog.Warn("webhook delivered successfully", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL, "status", resp.StatusCode, "attempt", job.Attempt)
 			return
 		}
 
 		if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= 500 {
+			slog.Warn("upstream server error", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL, "status", resp.StatusCode)
 			cb.RecordFailure()
 			isTransient = true
 		} else if resp.StatusCode == http.StatusTooManyRequests {
+			slog.Warn("rate limited by upstream", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL)
 			isTransient = true
 		} else {
-			slog.Warn("permanent client error, dropping webhook", "url", job.Subscriber.TargetURL, "status", resp.StatusCode)
+			slog.Warn("permanent client error, dropping webhook", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL, "status", resp.StatusCode)
 			return
 		}
 	}
@@ -228,10 +236,10 @@ func (b *Broker) handleRetryScheduling(job DeliveryJob) {
 		delay := nextBackoff(job.Attempt, b.cfg.BaseBackoff, b.cfg.MaxBackoff)
 		job.NextAttemptAt = time.Now().Add(delay)
 
-		slog.Info("transient error, scheduling retry", "url", job.Subscriber.TargetURL, "attempt", job.Attempt, "delay", delay)
+		slog.Info("transient error, scheduling retry", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL, "attempt", job.Attempt, "delay", delay)
 		b.scheduleRetry(job)
 	} else {
-		slog.Warn("exhausted retries, dropping webhook", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL)
+		slog.Warn("exhausted retries, dropping webhook", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL)
 	}
 }
 
@@ -320,6 +328,7 @@ func (b *Broker) getBreaker(url string) *CircuitBreaker {
 
 	if !exists {
 		val = &CircuitBreaker{
+			targetURL:                url,
 			state:                    StateClosed,
 			lastAccessed:             time.Now(),
 			failuresThreshold:        b.cfg.FailuresThreshold,
