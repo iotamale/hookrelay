@@ -20,6 +20,7 @@ type Config struct {
 	BreakerGCTTL             time.Duration
 	FailuresThreshold        uint16
 	OpenStateTimeoutDuration time.Duration
+	SlogOutputFormat         string
 }
 
 func Load() Config {
@@ -38,6 +39,7 @@ func Load() Config {
 		BreakerGCTTL:             getEnvAsDuration("BREAKER_GC_TTL", 24*time.Hour),
 		FailuresThreshold:        uint16(getEnvAsInt("FAILURES_THRESHOLD", 5)),
 		OpenStateTimeoutDuration: getEnvAsDuration("OPEN_STATE_TIMEOUT", 60*time.Second),
+		SlogOutputFormat:         getEnv("SLOG_OUTPUT_FORMAT", "tint"),
 	}
 }
 
