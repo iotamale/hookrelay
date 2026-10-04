@@ -154,7 +154,7 @@ func (b *Broker) Publish(evt Event) int {
 		case b.jobs <- deliveryJob:
 			queued++
 		default:
-			slog.Warn("buffer is full, job skipped", "job", deliveryJob)
+			slog.Warn("buffer is full, job skipped", "event_id", evt.ID, "topic", evt.Topic, "target_url", deliveryJob.Subscriber.TargetURL)
 		}
 	}
 
