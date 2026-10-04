@@ -92,25 +92,25 @@ func newRouter(b *broker.Broker) http.Handler {
 
 func main() {
 	appCfg := config.Load()
-	var handler slog.Handler
+	var slogHandler slog.Handler
 
 	switch appCfg.SlogOutputFormat {
 	case "json":
-		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		slogHandler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelInfo,
 		})
 	case "text":
-		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		slogHandler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelInfo,
 		})
 	default: // "tint"
-		handler = tint.NewTextHandler(os.Stdout, &tint.Options{
+		slogHandler = tint.NewTextHandler(os.Stdout, &tint.Options{
 			Level:      slog.LevelInfo,
 			TimeFormat: time.TimeOnly,
 		})
 	}
 
-	logger := slog.New(handler)
+	logger := slog.New(slogHandler)
 	slog.SetDefault(logger)
 
 	brokerCfg := broker.Config{
@@ -133,9 +133,12 @@ func main() {
 		addr = appCfg.Port
 	}
 
+	apiKey := appCfg.APIKey
+	httpHandler := authMiddleware(apiKey, maxBodyMiddleware(1<<20, newRouter(b)))
+
 	server := &http.Server{
 		Addr:    addr,
-		Handler: newRouter(b),
+		Handler: authMiddleware(apiKey, httpHandler),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

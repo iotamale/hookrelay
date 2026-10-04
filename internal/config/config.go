@@ -21,6 +21,7 @@ type Config struct {
 	FailuresThreshold        uint16
 	OpenStateTimeoutDuration time.Duration
 	SlogOutputFormat         string
+	APIKey                   string
 }
 
 func Load() Config {
@@ -40,6 +41,7 @@ func Load() Config {
 		FailuresThreshold:        uint16(getEnvAsInt("FAILURES_THRESHOLD", 5)),
 		OpenStateTimeoutDuration: getEnvAsDuration("OPEN_STATE_TIMEOUT", 60*time.Second),
 		SlogOutputFormat:         getEnv("SLOG_OUTPUT_FORMAT", "tint"),
+		APIKey:                   getEnv("API_KEY", ""),
 	}
 }
 
