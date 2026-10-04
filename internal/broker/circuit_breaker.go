@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -25,6 +26,7 @@ type CircuitBreaker struct {
 	failuresCount uint16
 	expiresAt     time.Time
 	lastAccessed  time.Time
+	targetURL     string
 
 	// FailuresThreshold defines how many consecutive failures are allowed
 	// before transitions to the OPEN state.
@@ -43,6 +45,9 @@ func (cb *CircuitBreaker) RecordFailure() {
 	cb.failuresCount++
 
 	if cb.failuresCount >= cb.failuresThreshold {
+		if cb.state != StateOpen {
+			slog.Warn("circuit breaker tripped to OPEN", "target_url", cb.targetURL)
+		}
 		cb.state = StateOpen
 		cb.expiresAt = time.Now().Add(cb.openStateTimeoutDuration)
 	}
@@ -53,6 +58,9 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if cb.state != StateClosed {
+		slog.Info("circuit breaker recovered to CLOSED", "target_url", cb.targetURL)
+	}
 	cb.failuresCount = 0
 	cb.state = StateClosed
 }
