@@ -1,24 +1,22 @@
 package broker
 
 import (
-	"bytes"
-	"container/heap"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"hookrelay/internal/breaker"
+	"hookrelay/internal/retry"
 )
 
 type Stats struct {
 	SuccessfulDeliveries uint64 `json:"successful_deliveries"`
-	FailedAttempts       uint64 `json:"failed_attempts"`    // retry
-	DroppedDeliveries    uint64 `json:"dropped_deliveries"` // critical errors, exceed max retries
+	FailedAttempts       uint64 `json:"failed_attempts"`
+	DroppedDeliveries    uint64 `json:"dropped_deliveries"`
 	JobQueueSize         int    `json:"job_queue_size"`
 }
 
@@ -47,108 +45,59 @@ type Event struct {
 	Timestamp time.Time       `json:"timestamp"`
 }
 
+type DeliveryJob struct {
+	Subscriber Subscriber
+	Event      Event
+}
+
 type Broker struct {
 	cfg            Config
 	mu             sync.RWMutex
 	subscribers    map[string][]Subscriber // topic -> []Subscribers
-	jobs           chan DeliveryJob
+	jobs           chan retry.Job
 	wg             sync.WaitGroup // tracks active worker goroutines
-	schedulerWg    sync.WaitGroup // tracks retry scheduler goroutine
+	schedulerWg    sync.WaitGroup // tracks background goroutines
 	workerCount    int
 	processedCount atomic.Int64
 	successCount   atomic.Uint64
 	droppedCount   atomic.Uint64
 	FailedAttempts atomic.Uint64
 	client         *http.Client
-	retryMu        sync.Mutex    // protects retires min heap
-	retries        *retryHeap    // Min-Heap ordering failed jobs by Broker.NextAttemptAt
-	newRetry       chan struct{} // wakes up retry scheduler when new job is pushed to the heap
-	done           chan struct{}
-	breakers       map[string]*CircuitBreaker // TargetURL -> *CircuitBreaker
-	breakersMu     sync.RWMutex
-	isRunning      atomic.Bool
-}
 
-type DeliveryJob struct {
-	Subscriber    Subscriber
-	Event         Event
-	Attempt       int
-	NextAttemptAt time.Time
+	retryScheduler *retry.Scheduler
+	breakerManager *breaker.Manager
+
+	ctx       context.Context
+	cancel    context.CancelFunc
+	isRunning atomic.Bool
 }
 
 func NewBroker(cfg Config) *Broker {
-	h := &retryHeap{}
-	heap.Init(h)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Broker{
 		cfg:         cfg,
 		subscribers: make(map[string][]Subscriber),
-		jobs:        make(chan DeliveryJob, cfg.QueueSize),
+		jobs:        make(chan retry.Job, cfg.QueueSize),
 		workerCount: cfg.WorkerCount,
 		client: &http.Client{
 			Timeout: 5 * time.Second,
 		},
-		breakers: make(map[string]*CircuitBreaker),
-		retries:  h,
-		newRetry: make(chan struct{}, 1),
-		done:     make(chan struct{}),
+		retryScheduler: retry.NewScheduler(cfg.BaseBackoff, cfg.MaxBackoff, cfg.MaxRetries),
+		breakerManager: breaker.NewManager(cfg.FailuresThreshold, cfg.OpenStateTimeoutDuration, cfg.BreakerGCInterval, cfg.BreakerGCTTL),
+		ctx:            ctx,
+		cancel:         cancel,
 	}
-}
-
-func (b *Broker) Subscribe(topic string, sub Subscriber) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.subscribers[topic] = append(b.subscribers[topic], sub)
-}
-
-func (b *Broker) UnsubscribeByUrl(topic, targetURL string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	subs, exists := b.subscribers[topic]
-	if !exists {
-		return false
-	}
-
-	n := 0 // new size of subs array
-	removed := false
-
-	for _, s := range subs {
-		if s.TargetURL != targetURL {
-			subs[n] = s
-			n++
-		} else {
-			removed = true
-		}
-	}
-
-	if removed {
-		// cut the array to fit only not-removed subs
-		b.subscribers[topic] = subs[:n]
-	}
-
-	return removed
-}
-
-func (b *Broker) GetSubscribers(topic string) []Subscriber {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	subs := b.subscribers[topic]
-	targets := make([]Subscriber, len(subs))
-	copy(targets, subs)
-
-	return targets
 }
 
 func (b *Broker) Start() {
 	slog.Info("starting broker")
-	b.schedulerWg.Add(1)
-	go b.retryScheduler()
 
 	b.schedulerWg.Add(1)
-	go b.breakerGarbageCollector()
+	go b.retryScheduler.Start(b.ctx, &b.schedulerWg, b.jobs)
+
+	b.schedulerWg.Add(1)
+	go b.breakerManager.StartGC(b.ctx, &b.schedulerWg)
 
 	slog.Info("initializing worker pool", "worker_count", b.workerCount)
 	for i := 0; i < b.workerCount; i++ {
@@ -163,8 +112,8 @@ func (b *Broker) Stop() {
 	b.isRunning.Store(false)
 	slog.Info("shutting down broker")
 
-	// Signal retry scheduler to stop accepting new jobs
-	close(b.done)
+	// Cancel background routines (retry scheduler, breaker GC)
+	b.cancel()
 	b.schedulerWg.Wait()
 
 	// Close the main job queue
@@ -174,269 +123,8 @@ func (b *Broker) Stop() {
 	slog.Info("broker shutdown complete", "processed_events", b.ProcessedCount())
 }
 
-func (b *Broker) worker() {
-	defer b.wg.Done()
-
-	for job := range b.jobs {
-		b.deliver(job)
-		b.processedCount.Add(1)
-	}
-
-}
-
-func (b *Broker) Publish(evt Event) int {
-	select {
-	case <-b.done:
-		// Broker is being shutdown, prevent writing to closed b.jobs channel
-		return 0
-	default:
-	}
-
-	subs := b.GetSubscribers(evt.Topic)
-	queued := 0
-
-	for _, sub := range subs {
-		deliveryJob := DeliveryJob{
-			Subscriber: sub,
-			Event:      evt,
-		}
-
-		select {
-		case b.jobs <- deliveryJob:
-			queued++
-		default:
-			slog.Warn("buffer is full, job skipped", "event_id", evt.ID, "topic", evt.Topic, "target_url", deliveryJob.Subscriber.TargetURL)
-		}
-	}
-
-	return queued
-}
-
 func (b *Broker) ProcessedCount() int64 {
 	return b.processedCount.Load()
-}
-
-func (b *Broker) deliver(job DeliveryJob) {
-	cb := b.getBreaker(job.Subscriber.TargetURL)
-
-	if !cb.Allow() {
-		b.handleRetryScheduling(job)
-		return
-	}
-
-	body, err := json.Marshal(job.Event)
-
-	if err != nil {
-		return
-	}
-
-	req, err := http.NewRequest(http.MethodPost, job.Subscriber.TargetURL, bytes.NewReader(body))
-
-	if err != nil {
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Hook-Event-ID", job.Event.ID)
-	req.Header.Set("X-Hook-Topic", job.Event.Topic)
-
-	if job.Subscriber.Secret != "" {
-		hashString := SignPayload(body, job.Subscriber.Secret)
-		req.Header.Set("X-Hook-Signature-256", hashString)
-	}
-
-	resp, err := b.client.Do(req)
-
-	isTransient := false
-
-	if err != nil {
-		slog.Warn("network error during delivery", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL, "error", err.Error())
-		cb.RecordFailure()
-		isTransient = true
-		b.FailedAttempts.Add(1)
-	} else {
-		defer resp.Body.Close()
-		_, _ = io.Copy(io.Discard, resp.Body)
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			cb.RecordSuccess()
-			slog.Warn("webhook delivered successfully", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL, "status", resp.StatusCode, "attempt", job.Attempt)
-			b.successCount.Add(1)
-			return
-		}
-
-		if resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode >= 500 {
-			slog.Warn("upstream server error", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL, "status", resp.StatusCode)
-			cb.RecordFailure()
-			isTransient = true
-			b.FailedAttempts.Add(1)
-		} else if resp.StatusCode == http.StatusTooManyRequests {
-			slog.Warn("rate limited by upstream", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL)
-			isTransient = true
-			b.FailedAttempts.Add(1)
-		} else {
-			slog.Warn("permanent client error, dropping webhook", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL, "status", resp.StatusCode)
-			b.droppedCount.Add(1)
-			return
-		}
-	}
-
-	if isTransient {
-		b.handleRetryScheduling(job)
-	}
-}
-
-func (b *Broker) handleRetryScheduling(job DeliveryJob) {
-	if job.Attempt < b.cfg.MaxRetries {
-		job.Attempt++
-		delay := nextBackoff(job.Attempt, b.cfg.BaseBackoff, b.cfg.MaxBackoff)
-		job.NextAttemptAt = time.Now().Add(delay)
-
-		slog.Info("transient error, scheduling retry", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL, "attempt", job.Attempt, "delay", delay)
-		b.scheduleRetry(job)
-	} else {
-		slog.Warn("exhausted retries, dropping webhook", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL)
-	}
-}
-
-func (b *Broker) scheduleRetry(job DeliveryJob) {
-	b.retryMu.Lock()
-	heap.Push(b.retries, job)
-	b.retryMu.Unlock()
-
-	// Wake up the scheduler
-	select {
-	case b.newRetry <- struct{}{}:
-	default:
-	}
-}
-
-func (b *Broker) retryScheduler() {
-	defer b.schedulerWg.Done()
-
-	timer := time.NewTimer(time.Hour)
-	if !timer.Stop() {
-		<-timer.C
-	}
-
-	for {
-		b.retryMu.Lock()
-		if b.retries.Len() == 0 {
-			b.retryMu.Unlock()
-			// The heap is empty, sleep until a new retry is scheduled.
-			select {
-			case <-b.newRetry:
-				continue
-			case <-b.done:
-				return
-			}
-		}
-
-		nextJob := (*b.retries)[0]
-		now := time.Now()
-
-		if now.After(nextJob.NextAttemptAt) || now.Equal(nextJob.NextAttemptAt) {
-			job := heap.Pop(b.retries).(DeliveryJob)
-			b.retryMu.Unlock()
-
-			select {
-			case b.jobs <- job:
-			default:
-				// buffer is full
-			}
-			continue
-		}
-
-		delay := nextJob.NextAttemptAt.Sub(now)
-		b.retryMu.Unlock()
-
-		timer.Reset(delay)
-
-		select {
-		case <-timer.C:
-		case <-b.newRetry:
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-b.done:
-			timer.Stop()
-			return
-		}
-	}
-}
-
-// getBreaker returns *CircuitBreaker for specified TargetURL.
-// If one doesn't exist, it creates a new one.
-func (b *Broker) getBreaker(url string) *CircuitBreaker {
-	b.breakersMu.RLock()
-	val, exists := b.breakers[url]
-	b.breakersMu.RUnlock()
-
-	if exists {
-		return val
-	}
-
-	b.breakersMu.Lock()
-	defer b.breakersMu.Unlock()
-
-	// Doublecheck
-	val, exists = b.breakers[url]
-
-	if !exists {
-		val = &CircuitBreaker{
-			targetURL:                url,
-			state:                    StateClosed,
-			lastAccessed:             time.Now(),
-			failuresThreshold:        b.cfg.FailuresThreshold,
-			openStateTimeoutDuration: b.cfg.OpenStateTimeoutDuration,
-		}
-		b.breakers[url] = val
-	}
-
-	return val
-}
-
-func SignPayload(payload []byte, secret string) string {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(payload)
-
-	hashString := hex.EncodeToString(mac.Sum(nil))
-	return "sha256=" + hashString
-}
-
-func (b *Broker) breakerGarbageCollector() {
-	defer b.schedulerWg.Done()
-
-	ticker := time.NewTicker(b.cfg.BreakerGCInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			b.cleanUpBreakers()
-		case <-b.done:
-			return // graceful shutdown
-		}
-	}
-}
-
-func (b *Broker) cleanUpBreakers() {
-	b.breakersMu.Lock()
-	defer b.breakersMu.Unlock()
-
-	now := time.Now()
-
-	for url, cb := range b.breakers {
-		cb.mu.Lock()
-		isClosed := cb.state == StateClosed
-		isStale := now.Sub(cb.lastAccessed) > b.cfg.BreakerGCTTL
-		cb.mu.Unlock()
-
-		if isClosed && isStale {
-			delete(b.breakers, url)
-		}
-	}
-
 }
 
 func (b *Broker) GetStats() Stats {

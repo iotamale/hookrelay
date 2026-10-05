@@ -1,4 +1,4 @@
-package broker
+package breaker
 
 import (
 	"testing"
