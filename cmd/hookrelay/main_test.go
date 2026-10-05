@@ -221,8 +221,8 @@ func TestHealthReadyStatsEndpoints(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/v1/stats", nil)
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("expected status 202, got %d", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
 	}
 	b.Stop()
 }

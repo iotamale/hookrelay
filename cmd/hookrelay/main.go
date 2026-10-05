@@ -73,7 +73,7 @@ func newRouter(b *broker.Broker, apiKey string) http.Handler {
 		stats := b.GetStats()
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
+		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(stats)
 	})
 
