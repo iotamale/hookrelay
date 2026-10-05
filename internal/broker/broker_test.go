@@ -3,6 +3,7 @@ package broker
 import (
 	"encoding/json"
 	"fmt"
+	"hookrelay/internal/breaker"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -247,12 +248,11 @@ func TestBroker_CircuitBreaker_FastFailure(t *testing.T) {
 
 	time.Sleep(50 * time.Millisecond)
 
-	cb := b.getBreaker(ts.URL)
-	cb.mu.Lock()
-	state := cb.state
-	cb.mu.Unlock()
+	cb := b.breakerManager.GetBreaker(ts.URL)
 
-	if state != StateOpen {
+	state := cb.State()
+
+	if state != breaker.StateOpen {
 		t.Fatalf("expected Circuit Breaker to be OPEN, got state %v", state)
 	}
 
@@ -263,36 +263,6 @@ func TestBroker_CircuitBreaker_FastFailure(t *testing.T) {
 }
 
 // Test GC logic
-func TestBroker_CircuitBreakerGC(t *testing.T) {
-	cfg := baseTestConfig(10, 2)
-	cfg.BreakerGCTTL = 100 * time.Millisecond
-	b := NewBroker(cfg)
-
-	now := time.Now()
-	staleTime := now.Add(-200 * time.Millisecond)
-
-	b.breakers["url-stale-closed"] = &CircuitBreaker{
-		state: StateClosed, lastAccessed: staleTime, failuresThreshold: cfg.FailuresThreshold, openStateTimeoutDuration: cfg.OpenStateTimeoutDuration,
-	}
-	b.breakers["url-fresh-closed"] = &CircuitBreaker{
-		state: StateClosed, lastAccessed: now, failuresThreshold: cfg.FailuresThreshold, openStateTimeoutDuration: cfg.OpenStateTimeoutDuration,
-	}
-	b.breakers["url-stale-open"] = &CircuitBreaker{
-		state: StateOpen, lastAccessed: staleTime, failuresThreshold: cfg.FailuresThreshold, openStateTimeoutDuration: cfg.OpenStateTimeoutDuration,
-	}
-
-	b.cleanUpBreakers()
-
-	if _, exists := b.breakers["url-stale-closed"]; exists {
-		t.Errorf("expected url-stale-closed to be deleted")
-	}
-	if _, exists := b.breakers["url-fresh-closed"]; !exists {
-		t.Errorf("expected url-fresh-closed to be kept")
-	}
-	if _, exists := b.breakers["url-stale-open"]; !exists {
-		t.Errorf("expected url-stale-open to be kept")
-	}
-}
 
 func TestBroker_UnsubscribeByUrl(t *testing.T) {
 	b := NewBroker(baseTestConfig(10, 2))

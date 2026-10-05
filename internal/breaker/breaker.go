@@ -1,4 +1,4 @@
-package broker
+package breaker
 
 import (
 	"log/slog"
@@ -87,4 +87,11 @@ func (cb *CircuitBreaker) Allow() bool {
 	default:
 		return true
 	}
+}
+
+// State returns current state of the circuit breaker.
+func (cb *CircuitBreaker) State() CircuitBreakerState {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.state
 }
