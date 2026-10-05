@@ -1,7 +1,9 @@
 package broker
 
 import (
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -40,5 +42,68 @@ func TestDelivery_ParseRetryAfter(t *testing.T) {
 	_, err = parseRetryAfter("invalid")
 	if err == nil {
 		t.Errorf("expected error, got nil")
+	}
+}
+
+func TestBroker_RetryAfterHeader_Integration(t *testing.T) {
+	var hits int
+	var firstHitTime time.Time
+	var secondHitTime time.Time
+
+	done := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			firstHitTime = time.Now()
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+
+		if hits == 2 {
+			secondHitTime = time.Now()
+			w.WriteHeader(http.StatusOK)
+			close(done)
+			return
+		}
+	}))
+	defer ts.Close()
+
+	// Use a long base backoff to prove we override it
+	cfg := Config{
+		QueueSize:                10,
+		WorkerCount:              1,
+		MaxRetries:               3,
+		BaseBackoff:              5 * time.Second,
+		MaxBackoff:               10 * time.Second,
+		FailuresThreshold:        5,
+		OpenStateTimeoutDuration: 10 * time.Second,
+		BreakerGCInterval:        10 * time.Second,
+		BreakerGCTTL:             10 * time.Second,
+	}
+
+	b := NewBroker(cfg)
+	b.Start()
+	defer b.Stop()
+
+	b.Subscribe("test_topic", Subscriber{ID: "sub-1", TargetURL: ts.URL})
+
+	b.Publish(Event{
+		ID:        "evt-1",
+		Topic:     "test_topic",
+		Payload:   json.RawMessage(`{}`),
+		Timestamp: time.Now(),
+	})
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("test timed out, likely ignored Retry-After and used 5s backoff")
+	}
+
+	diff := secondHitTime.Sub(firstHitTime)
+	if diff < 1*time.Second {
+		t.Errorf("expected at least 1s delay, got %v", diff)
 	}
 }
