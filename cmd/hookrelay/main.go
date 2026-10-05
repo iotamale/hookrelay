@@ -30,12 +30,12 @@ type publishRequest struct {
 }
 
 type unsubscribeRequest struct {
-	Topic     string `json:"topic`
+	Topic     string `json:"topic"`
 	TargetURL string `json:"target_url"`
 }
 
 type getSubscribersRequest struct {
-	Topic string `json:"topic`
+	Topic string `json:"topic"`
 }
 
 func generateID(prefix string) string {
