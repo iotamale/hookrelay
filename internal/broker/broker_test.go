@@ -293,3 +293,67 @@ func TestBroker_CircuitBreakerGC(t *testing.T) {
 		t.Errorf("expected url-stale-open to be kept")
 	}
 }
+
+func TestBroker_UnsubscribeByUrl(t *testing.T) {
+	b := NewBroker(baseTestConfig(10, 2))
+	topic := "alerts"
+
+	b.Subscribe(topic, Subscriber{ID: "sub-1", TargetURL: "http://url1.com"})
+	b.Subscribe(topic, Subscriber{ID: "sub-2", TargetURL: "http://url2.com"})
+	b.Subscribe(topic, Subscriber{ID: "sub-3", TargetURL: "http://url1.com"})
+
+	removed := b.UnsubscribeByUrl(topic, "http://url1.com")
+	if !removed {
+		t.Fatalf("expected UnsubscribeByUrl to return true")
+	}
+
+	subs := b.GetSubscribers(topic)
+	if len(subs) != 1 || subs[0].TargetURL != "http://url2.com" {
+		t.Fatalf("expected 1 remaining subscriber with url2, got: %+v", subs)
+	}
+
+	removed = b.UnsubscribeByUrl(topic, "http://nonexistent.com")
+	if removed {
+		t.Fatalf("expected UnsubscribeByUrl to return false for non-existent url")
+	}
+}
+
+func TestBroker_IsRunning(t *testing.T) {
+	b := NewBroker(baseTestConfig(10, 2))
+
+	if b.IsRunning() {
+		t.Fatalf("broker should not be running before Start()")
+	}
+
+	b.Start()
+	if !b.IsRunning() {
+		t.Fatalf("broker should be running after Start()")
+	}
+
+	b.Stop()
+	if b.IsRunning() {
+		t.Fatalf("broker should not be running after Stop()")
+	}
+}
+
+func TestBroker_GetStats(t *testing.T) {
+	b := NewBroker(baseTestConfig(10, 2))
+
+	b.successCount.Store(10)
+	b.FailedAttempts.Store(3)
+	b.droppedCount.Store(1)
+
+	stats := b.GetStats()
+	if stats.SuccessfulDeliveries != 10 {
+		t.Errorf("expected 10 successful deliveries, got %d", stats.SuccessfulDeliveries)
+	}
+	if stats.DroppedDeliveries != 1 {
+		t.Errorf("expected 1 dropped delivery, got %d", stats.DroppedDeliveries)
+	}
+	if stats.FailedAttempts != 3 {
+		t.Errorf("expected 3 failed attempts, got %d", stats.FailedAttempts)
+	}
+	if stats.JobQueueSize != 0 {
+		t.Errorf("expected 0 queue size, got %d", stats.JobQueueSize)
+	}
+}
