@@ -28,7 +28,7 @@ func testConfig(q, w int) broker.Config {
 
 func TestSubscribeEndpoint_Validation(t *testing.T) {
 	b := broker.NewBroker(testConfig(10, 2))
-	router := newRouter(b)
+	router := newRouter(b, "")
 
 	tests := []struct {
 		name           string
@@ -79,7 +79,7 @@ func TestSubscribeEndpoint_Validation(t *testing.T) {
 
 func TestPublishEndpoint_Validation(t *testing.T) {
 	b := broker.NewBroker(testConfig(10, 2))
-	router := newRouter(b)
+	router := newRouter(b, "")
 
 	tests := []struct {
 		name           string
@@ -143,7 +143,7 @@ func TestSubscribeAndPublish(t *testing.T) {
 
 	b := broker.NewBroker(testConfig(16, 2))
 	b.Start()
-	router := newRouter(b)
+	router := newRouter(b, "")
 
 	// Register subscriber via HTTP API
 	subPayload, _ := json.Marshal(map[string]string{
@@ -185,5 +185,108 @@ func TestSubscribeAndPublish(t *testing.T) {
 
 	if !webhookReceived.Load() {
 		t.Fatal("expected downstream receiver to receive signed webhook, but it did not")
+	}
+}
+
+func TestHealthReadyStatsEndpoints(t *testing.T) {
+	b := broker.NewBroker(testConfig(10, 2))
+	router := newRouter(b, "")
+
+	// Test health
+	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	// Test ready before start
+	req = httptest.NewRequest(http.MethodGet, "/v1/ready", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d", rec.Code)
+	}
+
+	// Test ready after start
+	b.Start()
+	req = httptest.NewRequest(http.MethodGet, "/v1/ready", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	// Test stats
+	req = httptest.NewRequest(http.MethodGet, "/v1/stats", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+	b.Stop()
+}
+
+func TestUnsubscribeEndpoint(t *testing.T) {
+	b := broker.NewBroker(testConfig(10, 2))
+	router := newRouter(b, "")
+
+	b.Subscribe("topic1", broker.Subscriber{ID: "sub-1", TargetURL: "http://test.com"})
+
+	tests := []struct {
+		name           string
+		body           string
+		expectedStatus int
+	}{
+		{
+			name:           "valid unsubscribe request",
+			body:           `{"topic":"topic1","target_url":"http://test.com"}`,
+			expectedStatus: http.StatusNoContent,
+		},
+		{
+			name:           "unsubscribe non-existent",
+			body:           `{"topic":"topic1","target_url":"http://test2.com"}`,
+			expectedStatus: http.StatusNotFound,
+		},
+		{
+			name:           "invalid body",
+			body:           `{"topic":""}`,
+			expectedStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodDelete, "/v1/subscribe", bytes.NewBufferString(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.expectedStatus {
+				t.Fatalf("expected status %d, got %d (body: %s)", tc.expectedStatus, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestGetSubscribersEndpoint(t *testing.T) {
+	b := broker.NewBroker(testConfig(10, 2))
+	router := newRouter(b, "")
+
+	b.Subscribe("topic1", broker.Subscriber{ID: "sub-1", TargetURL: "http://test.com"})
+
+	// Test valid with query param
+	req := httptest.NewRequest(http.MethodGet, "/v1/subscribers?topic=topic1", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rec.Code)
+	}
+
+	// Test missing topic
+	req = httptest.NewRequest(http.MethodGet, "/v1/subscribers", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", rec.Code)
 	}
 }

@@ -29,6 +29,15 @@ type publishRequest struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
+type unsubscribeRequest struct {
+	Topic     string `json:"topic"`
+	TargetURL string `json:"target_url"`
+}
+
+type getSubscribersRequest struct {
+	Topic string `json:"topic"`
+}
+
 func generateID(prefix string) string {
 	b := make([]byte, 6)
 	rand.Read(b)
@@ -36,15 +45,49 @@ func generateID(prefix string) string {
 	return prefix + hex.EncodeToString(b)
 }
 
-func newRouter(b *broker.Broker) http.Handler {
+func newRouter(b *broker.Broker, apiKey string) http.Handler {
+	// ------------------------ PUBLIC ENDPOINTS ------------------------
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /v1/subscribe", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"up"}`))
+	})
+
+	mux.HandleFunc("GET /v1/ready", func(w http.ResponseWriter, r *http.Request) {
+		running := b.IsRunning()
+
+		if running {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ready"}`))
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"not_ready"}`))
+		}
+	})
+
+	mux.HandleFunc("GET /v1/stats", func(w http.ResponseWriter, r *http.Request) {
+		stats := b.GetStats()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(stats)
+	})
+
+	// ------------------------ PROTECTED ENDPOINTS ------------------------
+	protectedMux := http.NewServeMux()
+
+	protectedMux.HandleFunc("POST /v1/subscribe", func(w http.ResponseWriter, r *http.Request) {
 		var req subscribeRequest
 		err := json.NewDecoder(r.Body).Decode(&req)
 
 		if err != nil || req.TargetURL == "" || req.Topic == "" {
-			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"invalid request"}`))
 			return
 		}
 
@@ -58,15 +101,61 @@ func newRouter(b *broker.Broker) http.Handler {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(sub)
+		json.NewEncoder(w).Encode(sub)
 	})
 
-	mux.HandleFunc("POST /v1/publish", func(w http.ResponseWriter, r *http.Request) {
+	protectedMux.HandleFunc("DELETE /v1/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		var req unsubscribeRequest
+		err := json.NewDecoder(r.Body).Decode(&req)
+
+		if err != nil || req.Topic == "" || req.TargetURL == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"invalid request"}`))
+			return
+		}
+
+		removed := b.UnsubscribeByUrl(req.Topic, req.TargetURL)
+
+		if removed {
+			w.WriteHeader(http.StatusNoContent)
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":"no subscriber meets specified params"}`))
+		}
+	})
+
+	protectedMux.HandleFunc("GET /v1/subscribers", func(w http.ResponseWriter, r *http.Request) {
+		topic := r.URL.Query().Get("topic")
+
+		if topic == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"invalid request"}`))
+			return
+		}
+
+		subs := b.GetSubscribers(topic)
+		if subs == nil {
+			subs = []broker.Subscriber{}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"subscribers": subs,
+			"topic":       topic,
+		})
+	})
+
+	protectedMux.HandleFunc("POST /v1/publish", func(w http.ResponseWriter, r *http.Request) {
 		var req publishRequest
 		err := json.NewDecoder(r.Body).Decode(&req)
 
 		if err != nil || req.Topic == "" {
-			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"invalid request"}`))
 			return
 		}
 
@@ -86,6 +175,8 @@ func newRouter(b *broker.Broker) http.Handler {
 			"queued_deliveries": queued,
 		})
 	})
+
+	mux.Handle("/", authMiddleware(apiKey, protectedMux))
 
 	return mux
 }
@@ -133,12 +224,10 @@ func main() {
 		addr = appCfg.Port
 	}
 
-	apiKey := appCfg.APIKey
-	httpHandler := authMiddleware(apiKey, maxBodyMiddleware(1<<20, newRouter(b)))
-
+	httpHandler := maxBodyMiddleware(1<<20, newRouter(b, appCfg.APIKey))
 	server := &http.Server{
 		Addr:    addr,
-		Handler: authMiddleware(apiKey, httpHandler),
+		Handler: httpHandler,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
