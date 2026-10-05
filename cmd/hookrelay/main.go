@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"hookrelay/internal/broker"
@@ -14,6 +12,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"uuid"
 
 	"github.com/lmittmann/tint"
 )
@@ -36,13 +35,6 @@ type unsubscribeRequest struct {
 
 type getSubscribersRequest struct {
 	Topic string `json:"topic"`
-}
-
-func generateID(prefix string) string {
-	b := make([]byte, 6)
-	rand.Read(b)
-
-	return prefix + hex.EncodeToString(b)
 }
 
 func newRouter(b *broker.Broker, apiKey string) http.Handler {
@@ -92,7 +84,7 @@ func newRouter(b *broker.Broker, apiKey string) http.Handler {
 		}
 
 		sub := broker.Subscriber{
-			ID:        generateID("sub-"),
+			ID:        uuid.NewV7().String(),
 			TargetURL: req.TargetURL,
 			Secret:    req.Secret,
 		}
@@ -160,7 +152,7 @@ func newRouter(b *broker.Broker, apiKey string) http.Handler {
 		}
 
 		evt := broker.Event{
-			ID:        generateID("evt-"),
+			ID:        uuid.NewV7().String(),
 			Topic:     req.Topic,
 			Payload:   req.Payload,
 			Timestamp: time.Now().UTC(),
