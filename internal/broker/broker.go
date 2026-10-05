@@ -15,6 +15,13 @@ import (
 	"time"
 )
 
+type Stats struct {
+	SuccessfulDeliveries uint64 `json:"successful_deliveries"`
+	FailedAttempts       uint64 `json:"failed_attempts"`    // retry
+	DroppedDeliveries    uint64 `json:"dropped_deliveries"` // critical errors, exceed max retries
+	JobQueueSize         int    `json:"job_queue_size"`
+}
+
 type Config struct {
 	QueueSize                int
 	WorkerCount              int
@@ -41,21 +48,25 @@ type Event struct {
 }
 
 type Broker struct {
-	cfg         Config
-	mu          sync.RWMutex
-	subscribers map[string][]Subscriber // topic -> []Subscribers
-	jobs        chan DeliveryJob
-	wg          sync.WaitGroup // tracks active worker goroutines
-	schedulerWg sync.WaitGroup // tracks retry scheduler goroutine
-	workerCount int
-	processed   atomic.Int64
-	client      *http.Client
-	retryMu     sync.Mutex    // protects retires min heap
-	retries     *retryHeap    // Min-Heap ordering failed jobs by Broker.NextAttemptAt
-	newRetry    chan struct{} // wakes up retry scheduler when new job is pushed to the heap
-	done        chan struct{}
-	breakers    map[string]*CircuitBreaker // TargetURL -> *CircuitBreaker
-	breakersMu  sync.RWMutex
+	cfg            Config
+	mu             sync.RWMutex
+	subscribers    map[string][]Subscriber // topic -> []Subscribers
+	jobs           chan DeliveryJob
+	wg             sync.WaitGroup // tracks active worker goroutines
+	schedulerWg    sync.WaitGroup // tracks retry scheduler goroutine
+	workerCount    int
+	processedCount atomic.Int64
+	successCount   atomic.Uint64
+	droppedCount   atomic.Uint64
+	FailedAttempts atomic.Uint64
+	client         *http.Client
+	retryMu        sync.Mutex    // protects retires min heap
+	retries        *retryHeap    // Min-Heap ordering failed jobs by Broker.NextAttemptAt
+	newRetry       chan struct{} // wakes up retry scheduler when new job is pushed to the heap
+	done           chan struct{}
+	breakers       map[string]*CircuitBreaker // TargetURL -> *CircuitBreaker
+	breakersMu     sync.RWMutex
+	isRunning      atomic.Bool
 }
 
 type DeliveryJob struct {
@@ -144,10 +155,14 @@ func (b *Broker) Start() {
 		b.wg.Add(1)
 		go b.worker()
 	}
+
+	b.isRunning.Store(true)
 }
 
 func (b *Broker) Stop() {
+	b.isRunning.Store(false)
 	slog.Info("shutting down broker")
+
 	// Signal retry scheduler to stop accepting new jobs
 	close(b.done)
 	b.schedulerWg.Wait()
@@ -164,7 +179,7 @@ func (b *Broker) worker() {
 
 	for job := range b.jobs {
 		b.deliver(job)
-		b.processed.Add(1)
+		b.processedCount.Add(1)
 	}
 
 }
@@ -198,7 +213,7 @@ func (b *Broker) Publish(evt Event) int {
 }
 
 func (b *Broker) ProcessedCount() int64 {
-	return b.processed.Load()
+	return b.processedCount.Load()
 }
 
 func (b *Broker) deliver(job DeliveryJob) {
@@ -238,6 +253,7 @@ func (b *Broker) deliver(job DeliveryJob) {
 		slog.Warn("network error during delivery", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL, "error", err.Error())
 		cb.RecordFailure()
 		isTransient = true
+		b.FailedAttempts.Add(1)
 	} else {
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, resp.Body)
@@ -245,6 +261,7 @@ func (b *Broker) deliver(job DeliveryJob) {
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			cb.RecordSuccess()
 			slog.Warn("webhook delivered successfully", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL, "status", resp.StatusCode, "attempt", job.Attempt)
+			b.successCount.Add(1)
 			return
 		}
 
@@ -252,11 +269,14 @@ func (b *Broker) deliver(job DeliveryJob) {
 			slog.Warn("upstream server error", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL, "status", resp.StatusCode)
 			cb.RecordFailure()
 			isTransient = true
+			b.FailedAttempts.Add(1)
 		} else if resp.StatusCode == http.StatusTooManyRequests {
 			slog.Warn("rate limited by upstream", "event_id", job.Event.ID, "url", job.Subscriber.TargetURL)
 			isTransient = true
+			b.FailedAttempts.Add(1)
 		} else {
 			slog.Warn("permanent client error, dropping webhook", "event_id", job.Event.ID, "target_url", job.Subscriber.TargetURL, "status", resp.StatusCode)
+			b.droppedCount.Add(1)
 			return
 		}
 	}
@@ -417,4 +437,17 @@ func (b *Broker) cleanUpBreakers() {
 		}
 	}
 
+}
+
+func (b *Broker) GetStats() Stats {
+	return Stats{
+		SuccessfulDeliveries: b.successCount.Load(),
+		FailedAttempts:       b.FailedAttempts.Load(),
+		DroppedDeliveries:    b.droppedCount.Load(),
+		JobQueueSize:         len(b.jobs),
+	}
+}
+
+func (b *Broker) IsRunning() bool {
+	return b.isRunning.Load()
 }

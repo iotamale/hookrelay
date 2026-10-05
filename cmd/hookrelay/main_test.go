@@ -28,7 +28,7 @@ func testConfig(q, w int) broker.Config {
 
 func TestSubscribeEndpoint_Validation(t *testing.T) {
 	b := broker.NewBroker(testConfig(10, 2))
-	router := newRouter(b)
+	router := newRouter(b, "")
 
 	tests := []struct {
 		name           string
@@ -79,7 +79,7 @@ func TestSubscribeEndpoint_Validation(t *testing.T) {
 
 func TestPublishEndpoint_Validation(t *testing.T) {
 	b := broker.NewBroker(testConfig(10, 2))
-	router := newRouter(b)
+	router := newRouter(b, "")
 
 	tests := []struct {
 		name           string
@@ -143,7 +143,7 @@ func TestSubscribeAndPublish(t *testing.T) {
 
 	b := broker.NewBroker(testConfig(16, 2))
 	b.Start()
-	router := newRouter(b)
+	router := newRouter(b, "")
 
 	// Register subscriber via HTTP API
 	subPayload, _ := json.Marshal(map[string]string{
