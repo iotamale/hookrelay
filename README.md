@@ -2,44 +2,43 @@
 
 ![CI](https://github.com/iotamale/hookrelay/actions/workflows/ci.yml/badge.svg)
 
-**HookRelay** is a high-performance, concurrent webhook delivery broker written in Go.
+HookRelay is a lightweight, concurrent webhook delivery broker written in Go.
 
-It acts as an intermediary layer that dispatches events to multiple subscribers, handling transient network errors, rate limits, and slow downstream services without degrading the core application's performance.
+I built this project to get hands-on experience with concurrent programming and distributed system patterns. Sending a webhook is easy, but reliably delivering it when the downstream server is slow, rate-limiting you, or completely dead is an engineering challenge.
 
-## Key Features
+## Under the Hood
 
-- **Smart Retries:** Implements **exponential backoff with jitter** to safely retry failed deliveries. It natively parses and honors upstream `Retry-After` HTTP headers (supports both seconds and HTTP-date formats).
-- **Resilient Delivery:** Failing endpoints trip the breaker, transitioning to a _Half-Open_ state for probing after a cooldown period. Includes a background Garbage Collector to clean up stale circuit breakers.
-- **Efficient Job Scheduling:** Utilizes a custom **min-heap** data structure paired for O(log n) retry scheduling.
-- **Highly Concurrent:** Built around a non-blocking Worker Pool architecture utilizing Go channels and atomic operations for safe state management.
-- **Observability:** Structured JSON logging using the standard library `log/slog`.
-- **Security First:**
-    - API Key authentication via `Bearer` token middleware.
-    - Payloads delivered to downstream services are signed using **HMAC SHA-256** (`X-Hook-Signature-256` header).
-    - Request body size limiting.
+Instead of just building a standard CRUD app, I wanted to tackle some real-world reliability problems:
+
+- **Circuit Breaker:** I implemented a custom circuit breaker with a background GC. It prevents the broker from hammering dead endpoints and transitions to a _Half-Open_ state to test recovery.
+- **Smart Retries & Min-Heap:** Implemented a custom min-heap to efficiently schedule retries `O(log n)`. It uses exponential backoff with jitter and strictly honors the upstream `Retry-After` HTTP headers.
+- **Concurrency:** The core runs on a non-blocking worker pool (Goroutines & Channels) with atomic counters, making it safe and fast.
+- **Security:** Outbound payloads are signed using HMAC SHA-256 (`X-Hook-Signature-256`), and the control API is protected by a static Bearer token.
+
+## How it works
+
+Here is how a webhook flows through the app:
+
+1. **Inbound:** When an event hits the API, it's shoved directly into a buffered `jobs` channel so the HTTP handler can return a `202 Accepted` immediately.
+2. **Delivery (Worker Pool):** A number of dedicated goroutines constantly listen to `jobs` channel and attempt to send the actual HTTP requests.
+3. **Circuit Breaker:** Before making the request, the worker checks with CB whether the URL is healthy. If the target server is known to be dead, we abort early.
+4. **Retry Loop:** If the delivery fails, the job gets passed to the Retry Scheduler and it is placed in a min-heap. Once the exponential backoff timer expires, it is pushed back into the `jobs` channel for another attempt.
 
 ## Getting Started
 
-### Prerequisites
-
-- Go 1.22 or higher
-
-### Local Development
+You'll need Go 1.27.1+.
 
 ```bash
-# Clone the repository
 git clone https://github.com/yourusername/hookrelay.git
 cd hookrelay
-
-# Run the application
 go run ./cmd/hookrelay
 ```
 
-The server will start on port `8080` by default.
+The server will start on port `8080`.
 
 ## Configuration
 
-Configuration is managed via environment variables or a `.env` file.
+You can configure the broker via `.env` or environment variables:
 
 | Variable             | Default   | Description                                         |
 | -------------------- | --------- | --------------------------------------------------- |
@@ -54,60 +53,31 @@ Configuration is managed via environment variables or a `.env` file.
 
 ## API Reference
 
-### Authentication
+Provide your API key via `Authorization: Bearer <API_KEY>`.
 
-All business-logic endpoints are protected by a static API key. You must include the API key in the `Authorization` header:
-`Authorization: Bearer <API_KEY>`
+### Managing Subscriptions (Protected)
 
-### Protected endpoints
+- `POST /v1/subscribe` - Register a new URL for a topic.
+    ```json
+    { "topic": "chat", "target_url": "https://api.example.com/webhook", "secret": "optional-hmac-secret" }
+    ```
+- `GET /v1/subscribers?topic=chat` - List active subscribers.
+- `DELETE /v1/subscribe?topic=chat&target_url=https://api.example.com/webhook` - Remove a subscriber.
 
-#### `POST /v1/publish`
+### Publishing Events (Protected)
 
-Publishes a new event to be delivered to all subscribers of a specific topic.
+- `POST /v1/publish` - Broadcast an event to all subscribers of a topic.
+    ```json
+    { "topic": "chat", "payload": { "username": "miguel1222", "message": "hello!" } }
+    ```
 
-```json
-{
-	"topic": "orders.created",
-	"payload": { "order_id": 9912, "status": "paid" }
-}
-```
+### Telemetry (Public)
 
-#### `POST /v1/subscribe`
-
-Registers a new subscriber for a topic.
-
-```json
-{
-	"topic": "orders.created",
-	"target_url": "https://api.example.com/webhook",
-	"secret": "optional-hmac-secret-for-signing"
-}
-```
-
-#### `DELETE /v1/subscribe?topic=...&target_url=...`
-
-Removes a subscription.
-
-#### `GET /v1/subscribers?topic=...`
-
-Returns a list of active subscribers for a given topic.
-
-### Public endpoints
-
-- `GET /v1/stats` - Returns current internal broker metrics (successes, failures, dropped events, and current queue size).
-- `GET /v1/health` - Returns 200 OK if the HTTP server is responsive.
-- `GET /v1/ready` - Returns 200 OK only if the internal worker pool has successfully started and is ready to process jobs (returns 503 during graceful shutdown).
-
-## Architecture Overview
-
-1. **Ingress:** HTTP requests are routed via standard `net/http` mux.
-2. **Broker Engine:** Events are placed into a buffered channel `b.jobs`.
-3. **Workers:** A predefined number of Goroutines continuously pull from `b.jobs` and attempt HTTP POST deliveries.
-4. **Resilience Layer:** If an upstream server timeouts, the `Circuit Breaker` records the failure. The event is pushed to the `retryHeap` and picked up by a dedicated scheduler for a future retry based on an exponential backoff algorithm.
+- `GET /v1/stats` - Internal metrics (successes, failures, dropped events, queue size).
+- `GET /v1/health` - Basic liveness probe.
+- `GET /v1/ready` - Readiness probe (returns 200 OK only when workers are running).
 
 ## Roadmap
 
-This project is continuously evolving. Planned improvements include:
-
-- Moving away from in-memory maps to a durable datastore (e.g., PostgreSQL or Redis) to ensure zero data loss during server restarts.
-- Dead Letter Queue: Storing permanently failed webhooks (max retries exceeded) for manual inspection and replay.
+- Replace in-memory maps with a durable datastore (SQLite or PostgreSQL) to survive restarts.
+- Introduce a dead letter queue to log permanantly failed webhooks.
