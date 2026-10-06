@@ -28,14 +28,7 @@ type publishRequest struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
-type unsubscribeRequest struct {
-	Topic     string `json:"topic"`
-	TargetURL string `json:"target_url"`
-}
 
-type getSubscribersRequest struct {
-	Topic string `json:"topic"`
-}
 
 func newRouter(b *broker.Broker, apiKey string) http.Handler {
 	// ------------------------ PUBLIC ENDPOINTS ------------------------
@@ -97,17 +90,17 @@ func newRouter(b *broker.Broker, apiKey string) http.Handler {
 	})
 
 	protectedMux.HandleFunc("DELETE /v1/subscribe", func(w http.ResponseWriter, r *http.Request) {
-		var req unsubscribeRequest
-		err := json.NewDecoder(r.Body).Decode(&req)
+		topic := r.URL.Query().Get("topic")
+		targetURL := r.URL.Query().Get("target_url")
 
-		if err != nil || req.Topic == "" || req.TargetURL == "" {
+		if topic == "" || targetURL == "" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"invalid request"}`))
+			w.Write([]byte(`{"error":"missing topic or target_url query parameter"}`))
 			return
 		}
 
-		removed := b.UnsubscribeByUrl(req.Topic, req.TargetURL)
+		removed := b.UnsubscribeByUrl(topic, targetURL)
 
 		if removed {
 			w.WriteHeader(http.StatusNoContent)

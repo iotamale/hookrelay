@@ -235,30 +235,29 @@ func TestUnsubscribeEndpoint(t *testing.T) {
 
 	tests := []struct {
 		name           string
-		body           string
+		url            string
 		expectedStatus int
 	}{
 		{
 			name:           "valid unsubscribe request",
-			body:           `{"topic":"topic1","target_url":"http://test.com"}`,
+			url:            "/v1/subscribe?topic=topic1&target_url=http://test.com",
 			expectedStatus: http.StatusNoContent,
 		},
 		{
 			name:           "unsubscribe non-existent",
-			body:           `{"topic":"topic1","target_url":"http://test2.com"}`,
+			url:            "/v1/subscribe?topic=topic1&target_url=http://test2.com",
 			expectedStatus: http.StatusNotFound,
 		},
 		{
-			name:           "invalid body",
-			body:           `{"topic":""}`,
+			name:           "missing query params",
+			url:            "/v1/subscribe?topic=",
 			expectedStatus: http.StatusBadRequest,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodDelete, "/v1/subscribe", bytes.NewBufferString(tc.body))
-			req.Header.Set("Content-Type", "application/json")
+			req := httptest.NewRequest(http.MethodDelete, tc.url, nil)
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
 			if rec.Code != tc.expectedStatus {
