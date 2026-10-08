@@ -26,7 +26,9 @@ Here is how a webhook flows through the app:
 
 ## Getting Started
 
-You'll need Go 1.27.1+.
+You'll need Go 1.27.1+ or Docker.
+
+### Run locally
 
 ```bash
 git clone https://github.com/yourusername/hookrelay.git
@@ -34,7 +36,15 @@ cd hookrelay
 go run ./cmd/hookrelay
 ```
 
-The server will start on port `8080`.
+### Run with Docker
+
+You can easily run the project using Docker Compose.
+
+```bash
+docker compose up -d
+```
+
+The server will start on the defined port (defaults to `8080`).
 
 ## Configuration
 
